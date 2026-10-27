@@ -7,17 +7,17 @@ namespace StudentCourseManagement.Repositories;
 
 public class EnrollmentRepository
 {
-    // Enroll a student and record the action in one transaction.
+    // Enroll a student and write an audit log in one transaction.
     public async Task<int> EnrollAsync(int studentId, int courseId)
     {
         await using var connection = DatabaseHelper.CreateConnection();
         await connection.OpenAsync();
 
-        await using SqlTransaction transaction =
-            (SqlTransaction)await connection.BeginTransactionAsync();
+        await using var transaction = connection.BeginTransaction();
 
         try
         {
+            // Confirm that both the student and course are active.
             const string checkSql = """
                 SELECT COUNT(*)
                 FROM Students s
@@ -30,16 +30,21 @@ public class EnrollmentRepository
             await using var checkCommand =
                 new SqlCommand(checkSql, connection, transaction);
 
-            checkCommand.Parameters.AddWithValue("@StudentId", studentId);
-            checkCommand.Parameters.AddWithValue("@CourseId", courseId);
+            checkCommand.Parameters.Add("@StudentId", System.Data.SqlDbType.Int)
+                .Value = studentId;
+            checkCommand.Parameters.Add("@CourseId", System.Data.SqlDbType.Int)
+                .Value = courseId;
 
             int validCount = Convert.ToInt32(
                 await checkCommand.ExecuteScalarAsync());
 
             if (validCount == 0)
+            {
                 throw new InvalidOperationException(
                     "Student or course does not exist or is inactive.");
+            }
 
+            // Insert the enrollment.
             const string insertSql = """
                 INSERT INTO Enrollments (StudentId, CourseId, Status)
                 VALUES (@StudentId, @CourseId, N'Enrolled');
@@ -50,29 +55,35 @@ public class EnrollmentRepository
             await using var insertCommand =
                 new SqlCommand(insertSql, connection, transaction);
 
-            insertCommand.Parameters.AddWithValue("@StudentId", studentId);
-            insertCommand.Parameters.AddWithValue("@CourseId", courseId);
+            insertCommand.Parameters.Add("@StudentId", System.Data.SqlDbType.Int)
+                .Value = studentId;
+            insertCommand.Parameters.Add("@CourseId", System.Data.SqlDbType.Int)
+                .Value = courseId;
 
             int enrollmentId = Convert.ToInt32(
                 await insertCommand.ExecuteScalarAsync());
 
+            // Audit log is part of the same transaction.
             await AddAuditAsync(
-                connection, transaction,
-                enrollmentId, "INSERT",
+                connection,
+                transaction,
+                enrollmentId,
+                "INSERT",
                 $"Student {studentId} enrolled in course {courseId}.");
 
             await transaction.CommitAsync();
+
             return enrollmentId;
         }
         catch
         {
-            await transaction.RollbackAsync();
+            await RollbackSafelyAsync(transaction);
             throw;
         }
     }
 
-    // Get all enrollments, including student and course names.
-    public Task<List<Enrollment>> GetAllAsync()
+    // View all enrollments with student and course names.
+    public Task<List<EnrollmentDetails>> GetAllAsync()
     {
         const string sql = """
             SELECT e.EnrollmentId, e.StudentId, s.Name AS StudentName,
@@ -86,8 +97,8 @@ public class EnrollmentRepository
         return GetListAsync(sql, null);
     }
 
-    // Get enrollments for one student.
-    public Task<List<Enrollment>> GetByStudentAsync(int studentId)
+    // View enrollments belonging to one student.
+    public Task<List<EnrollmentDetails>> GetByStudentAsync(int studentId)
     {
         const string sql = """
             SELECT e.EnrollmentId, e.StudentId, s.Name AS StudentName,
@@ -102,8 +113,8 @@ public class EnrollmentRepository
         return GetListAsync(sql, studentId);
     }
 
-    // Get students enrolled in one course.
-    public Task<List<Enrollment>> GetByCourseAsync(int courseId)
+    // View students enrolled in one course.
+    public Task<List<EnrollmentDetails>> GetByCourseAsync(int courseId)
     {
         const string sql = """
             SELECT e.EnrollmentId, e.StudentId, s.Name AS StudentName,
@@ -118,11 +129,11 @@ public class EnrollmentRepository
         return GetListAsync(sql, courseId);
     }
 
-    // Shared method for reading enrollment lists.
-    private static async Task<List<Enrollment>> GetListAsync(
+    // Shared method for retrieving enrollment lists.
+    private static async Task<List<EnrollmentDetails>> GetListAsync(
         string sql, int? id)
     {
-        var enrollments = new List<Enrollment>();
+        var enrollments = new List<EnrollmentDetails>();
 
         await using var connection = DatabaseHelper.CreateConnection();
         await connection.OpenAsync();
@@ -130,13 +141,16 @@ public class EnrollmentRepository
         await using var command = new SqlCommand(sql, connection);
 
         if (id.HasValue)
-            command.Parameters.AddWithValue("@Id", id.Value);
+        {
+            command.Parameters.Add("@Id", System.Data.SqlDbType.Int)
+                .Value = id.Value;
+        }
 
         await using var reader = await command.ExecuteReaderAsync();
 
         while (await reader.ReadAsync())
         {
-            enrollments.Add(new Enrollment
+            enrollments.Add(new EnrollmentDetails
             {
                 EnrollmentId = reader.GetInt32(0),
                 StudentId = reader.GetInt32(1),
@@ -151,18 +165,23 @@ public class EnrollmentRepository
         return enrollments;
     }
 
-    // Complete or cancel an active enrollment.
+    // Complete or cancel an enrollment that is currently active.
     public async Task<bool> UpdateStatusAsync(
         int enrollmentId, string status)
     {
+        if (enrollmentId <= 0)
+            throw new ArgumentException("Invalid enrollment ID.");
+
         if (status != "Completed" && status != "Cancelled")
-            throw new ArgumentException("Invalid enrollment status.");
+        {
+            throw new ArgumentException(
+                "Status must be Completed or Cancelled.");
+        }
 
         await using var connection = DatabaseHelper.CreateConnection();
         await connection.OpenAsync();
 
-        await using SqlTransaction transaction =
-            (SqlTransaction)await connection.BeginTransactionAsync();
+        await using var transaction = connection.BeginTransaction();
 
         try
         {
@@ -176,32 +195,38 @@ public class EnrollmentRepository
             await using var command =
                 new SqlCommand(sql, connection, transaction);
 
-            command.Parameters.AddWithValue("@Status", status);
-            command.Parameters.AddWithValue("@EnrollmentId", enrollmentId);
+            command.Parameters.Add("@Status", System.Data.SqlDbType.NVarChar, 20)
+                .Value = status;
+            command.Parameters.Add("@EnrollmentId", System.Data.SqlDbType.Int)
+                .Value = enrollmentId;
 
-            int rows = await command.ExecuteNonQueryAsync();
+            int rowsAffected = await command.ExecuteNonQueryAsync();
 
-            if (rows == 0)
+            if (rowsAffected == 0)
             {
                 await transaction.RollbackAsync();
                 return false;
             }
 
             await AddAuditAsync(
-                connection, transaction, enrollmentId, "UPDATE",
+                connection,
+                transaction,
+                enrollmentId,
+                "UPDATE",
                 $"Enrollment status changed to {status}.");
 
             await transaction.CommitAsync();
+
             return true;
         }
         catch
         {
-            await transaction.RollbackAsync();
+            await RollbackSafelyAsync(transaction);
             throw;
         }
     }
 
-    // Insert an audit record using the same transaction.
+    // Insert audit information using the existing transaction.
     private static async Task AddAuditAsync(
         SqlConnection connection,
         SqlTransaction transaction,
@@ -219,10 +244,31 @@ public class EnrollmentRepository
         await using var command =
             new SqlCommand(sql, connection, transaction);
 
-        command.Parameters.AddWithValue("@EntityId", enrollmentId);
-        command.Parameters.AddWithValue("@Action", action);
-        command.Parameters.AddWithValue("@Details", details);
+        command.Parameters.Add("@EntityId", System.Data.SqlDbType.Int)
+            .Value = enrollmentId;
+        command.Parameters.Add("@Action", System.Data.SqlDbType.NVarChar, 50)
+            .Value = action;
+        command.Parameters.Add("@Details", System.Data.SqlDbType.NVarChar, -1)
+            .Value = details;
 
         await command.ExecuteNonQueryAsync();
+    }
+
+    // Avoid hiding the original exception if rollback itself fails.
+    private static async Task RollbackSafelyAsync(
+        SqlTransaction transaction)
+    {
+        try
+        {
+            await transaction.RollbackAsync();
+        }
+        catch (SqlException)
+        {
+            // Preserve the original exception.
+        }
+        catch (InvalidOperationException)
+        {
+            // Transaction may already be completed or disconnected.
+        }
     }
 }
